@@ -139,12 +139,12 @@ class MatchingSystem:
             return matrix
         
         elif n_rows>n_cols:
-            print(f"Adding {n_rows-n_cols} ghost columns")
+            self._log(f"Adding {n_rows-n_cols} ghost columns")
             diff=n_rows-n_cols
             padding=np.full((n_rows,diff),-1e9)
             return np.hstack([matrix,padding])
         else:
-            print(f"Adding {n_cols-n_rows} ghost rows")
+            self._log(f"Adding {n_cols-n_rows} ghost rows")
             diff=n_cols-n_rows
             padding=np.full((diff,n_cols),-1e9)
             return np.vstack([matrix,padding])
@@ -191,13 +191,19 @@ class MatchingSystem:
             
             # === ERROR HANDLING ===
             # if a mentee is matched with a dummy column
+            i=0
             if col_idx>=len(mentor_mapping):
-                self._log("Avoiding matches with padded columns")
+                i+=1
+                if i<1:
+                    self._log("Avoiding matches with padded columns")
                 continue
 
             # if a mentor is matched with a dummy row
+            j=0
             if mentee_idx>=self.n_mentees:
-                self._log("Avoiding matches with padded rows")
+                j+=1
+                if j<=1:
+                    self._log("Avoiding matches with padded rows")
                 continue
             
             # get mentor index based on the column values
@@ -208,42 +214,129 @@ class MatchingSystem:
 
             if score>-1e8:
                 # add the match to the list
-                matches.append((mentor_idx,mentee_idx,score))
+                matches.append((mentee_idx,mentor_idx,score))
 
                 # keep track of mentor_utilization  
                 mentor_util[mentor_idx]+=1
 
-            # track of mentees who are matched
-            matched_mentees=set([m[0] for m in matches])
+        # track of mentees who are matched
+        matched_mentees=set([m[0] for m in matches])
 
-            # track of unmatched mentees
-            unmatched_mentees=[i for i in range(self.n_mentees) if i not in matched_mentees]
+        # track of unmatched mentees
+        unmatched_mentees=[i for i in range(self.n_mentees) if i not in matched_mentees]
 
-            # track of matched mentors
-            matched_mentors=set([m[1] for m in matches])
+        # track of matched mentors
+        matched_mentors=set([m[1] for m in matches])
 
-            #track of unmatched mentors
-            unmatched_mentors=[i for i in range(self.n_mentors) if i not in matched_mentors]
+        #track of unmatched mentors
+        unmatched_mentors=[i for i in range(self.n_mentors) if i not in matched_mentors]
 
-            total_score=sum(m[2] for m in matches)
-            avg_score=total_score/len(matches) if matches else 0
+        total_score=sum(m[2] for m in matches)
+        avg_score=total_score/len(matches) if matches else 0
 
-            elapsed=(time.time()-start)*1000
+        elapsed=(time.time()-start)*1000
+        
+        self._log(f"Generated {len(matches)} matches")
+        self._log(f"{len(matched_mentees)} mentees assigned")
+        self._log(f"{len(matched_mentors)} mentors assigned")
+        self._log(f"Average score: {avg_score:.6f}")
+        self._log(f"Execution time: {elapsed:.2f}ms")
+
+        return MatchingResults(
+            algorithm="Hungarian",
+            matches=matches,
+            unmatched_mentees=unmatched_mentees,
+            unmatched_mentors=unmatched_mentors,
+            mentor_utilization=mentor_util,
+            total_score=total_score,
+            average_score=avg_score,
+            num_matches=len(matches),
+            execution_time_ms=elapsed
+        )
+    
+    def results_to_df(self, results: MatchingResults) -> pd.DataFrame:
+        """
+        Converts MatchingResults into a clean, readable Pandas DataFrame.
+        """
+        # Create the base DataFrame
+        df = pd.DataFrame(results.matches, columns=['mentee_idx', 'mentor_idx', 'score'])
+        
+        # Map the indices to the actual IDs you provided in __init__
+        df['Mentee ID'] = df['mentee_idx'].apply(lambda x: self.mentee_ids[x])
+        df['Mentor ID'] = df['mentor_idx'].apply(lambda x: self.mentor_ids[x])
+        
+        # Reorder and return only the readable columns
+        return df[['Mentee ID', 'Mentor ID', 'score']]
+    
+    def validate_results(self, results: MatchingResults):
+        """
+        Hard-check on the matching output. 
+        Will throw an assertion error if the math doesn't add up.
+        """
+        self._log("\n>>> AUDITING MATCH DATA")
+        
+        # 1. Capacity Check: Using a counter to be sure
+        actual_counts = defaultdict(int)
+        for _, mentor_idx, _ in results.matches:
+            actual_counts[mentor_idx] += 1
             
-            self._log(f"Generated {len(matches)} matches")
-            self._log(f"{len(matched_mentees)} mentees assigned")
-            self._log(f"{len(matched_mentors)} mentors assigned")
-            self._log(f"Average score: {avg_score:.6f}")
-            self._log(f"Execution time: {elapsed:.2f}ms")
+        for m_idx, count in actual_counts.items():
+            limit = self.mentor_capacities[m_idx]
+            if count > limit:
+                raise ValueError(f"CRITICAL: {self.mentor_ids[m_idx]} over-assigned! ({count}/{limit})")
 
-            return MatchingResults(
-                algorithm="Hungarian",
-                matches=matches,
-                unmatched_mentees=unmatched_mentees,
-                unmatched_mentors=unmatched_mentors,
-                mentor_utilization=mentor_util,
-                total_score=total_score,
-                average_score=avg_score,
-                num_matches=len(matches),
-                execution_time_ms=elapsed
-            )
+        # 2. Uniqueness: One mentee, one slot.
+        mentees_seen = [m[0] for m in results.matches]
+        if len(mentees_seen) != len(set(mentees_seen)):
+            raise ValueError("CRITICAL: Duplicate mentee detected in match list!")
+
+        # 3. Score Truth: Cross-ref against the raw similarity matrix
+        for m_idx, mentor_idx, score in results.matches:
+            raw_val = self.similarity[m_idx, mentor_idx]
+            if not np.isclose(raw_val, score):
+                raise ValueError(f"DATA MISMATCH: Score for M{m_idx}->Mentor{mentor_idx} is tampered.")
+
+        # 4. Ghost/Padding logic check
+        # Matches + Unmatched Mentees must = total mentees
+        if (len(results.matches) + len(results.unmatched_mentees)) != self.n_mentees:
+            raise ValueError("LEAK DETECTED: Total mentee count doesn't balance with match/unmatch lists.")
+
+        self._log(">>> [OK] Constraints verified. No leaks.")
+
+    @staticmethod
+    def test_algo():
+        actual_n_mentees, actual_n_mentors = pd.read_csv('similarity_scores.csv', index_col=0).values.shape
+
+        mentee_ids = [f"mentee_{i:03d}" for i in range(actual_n_mentees)]
+        mentor_ids = [f"mentor_{i:03d}" for i in range(actual_n_mentors)]
+
+        system=MatchingSystem(
+            similarity_csv='similarity_scores.csv',
+            mentor_capacities=np.random.randint(1,4,len(mentor_ids)).tolist(),
+            mentee_ids=mentee_ids,
+            mentor_ids=mentor_ids
+        )
+
+        results = system.match_hungarian()
+
+        try:
+            system.validate_results(results)
+        except ValueError as e:
+            print(f"\n[!] MATCHING FAILED VALIDATION: {e}")
+            return
+
+        # If we got here, it's safe to look at the data
+        print("\nTop 5 Matches:")
+        df = system.results_to_df(results)
+        print(df.head(5).to_string(index=False))
+
+        df_results = system.results_to_df(results)
+        
+        print("\n" + "="*30)
+        print("DETAILED MATCHING BREAKDOWN")
+        print("="*30)
+        # to_string(index=False) hides the 0, 1, 2... row numbers
+        print(df_results.to_string(index=False))
+
+if __name__=="__main__":
+    MatchingSystem.test_algo()
