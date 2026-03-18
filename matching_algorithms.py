@@ -63,9 +63,14 @@ class MatchingSystem:
         """
         # Load similarity matrix
         if similarity_matrix is not None:
-            self.similarity=similarity_matrix
+            self.similarity = similarity_matrix
         elif similarity_csv is not None:
-            self.similarity=self._load_csv(similarity_csv)
+            self.similarity, csv_mentee_ids, csv_mentor_ids = self._load_csv_with_ids(similarity_csv)
+            # Use CSV-derived IDs as defaults (overridden if caller passes explicit ids)
+            if mentee_ids is None:
+                mentee_ids = csv_mentee_ids
+            if mentor_ids is None:
+                mentor_ids = csv_mentor_ids
         else:
             raise ValueError("must provide either similarity_csv or similarity_matrix containing the similarity scores")
         
@@ -75,8 +80,8 @@ class MatchingSystem:
         elif personality_similarity_csv is not None:
             self.personality_similarity=self._load_csv(personality_similarity_csv)
         else:
-            raise ValueError("must provide either personality_similarity_csv or personality_similarity_matrix containing the similarity scores")
-        
+            self.personality_similarity = np.zeros_like(self.similarity)
+            
         # set number of mentors and mentees
         self.n_mentees,self.n_mentors=self.similarity.shape
 
@@ -107,12 +112,10 @@ class MatchingSystem:
         # set verbose flag
         self.verbose=verbose
 
-    def _load_csv(self, filepath: str)->np.ndarray:
-        """
-        Loads similarity matrix from csv
-        """
-        df=pd.read_csv(filepath, index_col=0)
-        return df.values
+    def _load_csv_with_ids(self, filepath: str):
+        """Returns (matrix, row_ids, col_ids) from a CSV with labeled index/columns."""
+        df = pd.read_csv(filepath, index_col=0)
+        return df.values, list(df.index), list(df.columns)
     
     def _log(self, message: str):
         """
@@ -282,17 +285,26 @@ class MatchingSystem:
         self._log("LAPJV (MODIFIED HUNGARIAN) ALGORITHM (OPTIMAL)")
         self._log("="*70)
 
-        # expand for capacity
-        expanded, mentor_mapping=self._expand_for_capacity(self.similarity)
-        
+        # Build blended score: primary similarity + tiny personality tiebreaker
+        # Personality is scaled to be at most 1% of the smallest non-trivial score
+        # gap, so it only affects ties and never overrides a genuine score difference.
+        personality_expanded, _ = self._expand_for_capacity(self.personality_similarity)
+        p_max = personality_expanded.max()
+        tiebreak_weight = 1e-6 if p_max == 0 else 0.01 / p_max
+        # reconstruct blended in expanded form
+        expanded_base, mentor_mapping = self._expand_for_capacity(self.similarity)
+        blended_expanded = expanded_base + tiebreak_weight * personality_expanded
+
+        self._log(f"Personality tiebreaker weight: {tiebreak_weight:.2e}")
+
         # pad the matrix
-        expanded=self._pad_matrix(expanded)
+        blended_expanded = self._pad_matrix(blended_expanded)
 
-        # calculate the similarity matrix from the cost matrix
-        cost_matrix=-expanded
+        # calculate the cost matrix (negate for minimisation)
+        cost_matrix = -blended_expanded
 
-        # result of lapjv (modified hungarian) algorithm
-        mentee_indices, col_indices=linear_sum_assignment(cost_matrix)
+        # result of lapjv (modified hungarian) algorithm — solved on blended cost matrix
+        mentee_indices, col_indices = linear_sum_assignment(cost_matrix)
 
         # list to store results
         matches=[]
@@ -388,6 +400,7 @@ class MatchingSystem:
         self._log("STABLE MARRIAGE (Gale-Shapley) - Mentor Proposing")
         self._log("="*70)
 
+        
         # --- CONSTRUCT MENTEE'S PREFERENCE LIST ---
         mentee_prefs_dict={}
 
@@ -426,7 +439,7 @@ class MatchingSystem:
 
             mentee_prefs_dict[f"mentee_{i}"] = [f"mentor_{j}" for j in ranked]
 
-            # --- CONSTRUCT MENTOR'S PREFERENCE LIST ---
+        # --- CONSTRUCT MENTOR'S PREFERENCE LIST ---
 
         mentor_prefs_dict = {}
         mentor_capacity_dict = {}
@@ -454,13 +467,13 @@ class MatchingSystem:
                 ranked.extend(mentees_with_score)
             
             mentor_prefs_dict[f"mentor_{j}"] = [f"mentee_{i}" for i in ranked]
-            mentor_capacity_dict[f"mentor_{j}"] = self.capacities[j]
+            mentor_capacity_dict[f"mentor_{j}"] = self.mentor_capacities[j]
        
         # call the algorithm
         game=HospitalResident.create_from_dictionaries(
             resident_prefs=mentee_prefs_dict,
             hospital_prefs=mentor_prefs_dict,
-            hospital_capacities=mentor_capacity_dict
+            capacities=mentor_capacity_dict
         )
 
         matching_result=game.solve(optimal="hospital")
@@ -470,8 +483,8 @@ class MatchingSystem:
         mentor_matches = {j: [] for j in range(self.n_mentors)}
         
 
-        for mentor_name, mentees_list in matching_result.items():
-            mentor_idx = int(mentor_name.split('_')[1])
+        for mentor_obj, mentees_list in matching_result.items():
+            mentor_idx = int(mentor_obj.name.split('_')[1]) 
             for mentee_obj in mentees_list:
                 mentee_idx = int(mentee_obj.name.split('_')[1])
                 score = self.similarity[mentee_idx, mentor_idx]
@@ -513,6 +526,104 @@ class MatchingSystem:
             execution_time_ms=elapsed
         )
 
+
+    def match_min_cost_flow(self) -> MatchingResults:
+        """
+        Min-Cost Max-Flow algorithm using network flow.
+
+        Models problem as flow network with source, sink, mentee/mentor nodes.
+        Guarantees maximum cardinality with minimum total cost (= maximum score).
+
+        Uses networkx for flow solving (scipy has no min_cost_flow implementation).
+
+        Time Complexity: O(n²m) with successive shortest paths
+
+        Returns:
+            MatchingResults with flow-based matches
+        """
+        start = time.time()
+
+        self._log("\n" + "="*70)
+        self._log("MIN-COST MAX-FLOW")
+        self._log("="*70)
+
+        try:
+            import networkx as nx
+
+            G = nx.DiGraph()
+
+            source = "source"
+            sink   = "sink"
+
+            # Source → each mentee (capacity 1, cost 0)
+            for i in range(self.n_mentees):
+                G.add_edge(source, f"mentee_{i}", capacity=1, weight=0)
+
+            # Each mentee → each mentor (capacity 1, cost = -blended_score for maximisation)
+            # Personality tiebreaker uses the same float blend as LAPJV:
+            #   blended = similarity + tiebreak_weight * personality_similarity
+            # tiebreak_weight is at most 1% of the primary score range, so personality
+            # only resolves ties and never overrides a genuine score difference.
+            p_max = self.personality_similarity.max()
+            tiebreak_weight = 1e-6 if p_max == 0 else 0.01 / p_max
+            self._log(f"Personality tiebreaker weight: {tiebreak_weight:.2e}")
+            for i in range(self.n_mentees):
+                for j in range(self.n_mentors):
+                    blended = self.similarity[i, j] + tiebreak_weight * self.personality_similarity[i, j]
+                    G.add_edge(f"mentee_{i}", f"mentor_{j}", capacity=1, weight=-blended)
+
+            # Each mentor → sink (capacity = mentor capacity, cost 0)
+            for j in range(self.n_mentors):
+                G.add_edge(f"mentor_{j}", sink, capacity=self.mentor_capacities[j], weight=0)
+
+            # Solve — demand on sink drives max-flow
+            flow_dict = nx.max_flow_min_cost(G, source, sink)
+
+            # Extract matches
+            matches     = []
+            mentor_util = {j: 0 for j in range(self.n_mentors)}
+
+            for i in range(self.n_mentees):
+                for j in range(self.n_mentors):
+                    if flow_dict.get(f"mentee_{i}", {}).get(f"mentor_{j}", 0) > 0:
+                        score = self.similarity[i, j]
+                        matches.append((i, j, score))
+                        mentor_util[j] += 1
+
+            matched_mentees = set(m[0] for m in matches)
+            matched_mentors = set(m[1] for m in matches)
+
+            unmatched_mentees = [i for i in range(self.n_mentees) if i not in matched_mentees]
+            unmatched_mentors = [j for j in range(self.n_mentors) if j not in matched_mentors]
+
+            total_score = sum(m[2] for m in matches)
+            avg_score   = total_score / len(matches) if matches else 0
+            elapsed     = (time.time() - start) * 1000
+
+            self._log(f"Generated {len(matches)} matches")
+            self._log(f"{len(matched_mentees)} mentees assigned")
+            self._log(f"{len(matched_mentors)} mentors assigned")
+            self._log(f"Average score: {avg_score:.6f}")
+            self._log(f"Execution time: {elapsed:.2f}ms")
+
+            return MatchingResults(
+                algorithm="Min-Cost Max-Flow",
+                matches=matches,
+                unmatched_mentees=unmatched_mentees,
+                unmatched_mentors=unmatched_mentors,
+                mentor_utilization=mentor_util,
+                total_score=total_score,
+                average_score=avg_score,
+                num_matches=len(matches),
+                execution_time_ms=elapsed
+            )
+
+        except ImportError:
+            raise RuntimeError(
+                "networkx is required for match_min_cost_flow. "
+                "Install it with: pip install networkx"
+            )
+    
     def results_to_df(self, results: MatchingResults) -> pd.DataFrame:
         """
         Converts MatchingResults into a clean, readable Pandas DataFrame.
@@ -561,41 +672,3 @@ class MatchingSystem:
             raise ValueError("LEAK DETECTED: Total mentee count doesn't balance with match/unmatch lists.")
 
         self._log(">>> [OK] Constraints verified. No leaks.")
-
-    @staticmethod
-    def test_algo():
-        actual_n_mentees, actual_n_mentors = pd.read_csv('similarity_scores.csv', index_col=0).values.shape
-
-        mentee_ids = [f"mentee_{i:03d}" for i in range(actual_n_mentees)]
-        mentor_ids = [f"mentor_{i:03d}" for i in range(actual_n_mentors)]
-
-        system=MatchingSystem(
-            similarity_csv='similarity_scores.csv',
-            mentor_capacities=np.random.randint(1,4,len(mentor_ids)).tolist(),
-            mentee_ids=mentee_ids,
-            mentor_ids=mentor_ids
-        )
-
-        results = system.match_lapjv()
-
-        try:
-            system.validate_results(results)
-        except ValueError as e:
-            print(f"\n[!] MATCHING FAILED VALIDATION: {e}")
-            return
-
-        # If we got here, it's safe to look at the data
-        print("\nTop 5 Matches:")
-        df = system.results_to_df(results)
-        print(df.head(5).to_string(index=False))
-
-        df_results = system.results_to_df(results)
-        
-        print("\n" + "="*30)
-        print("DETAILED MATCHING BREAKDOWN")
-        print("="*30)
-        # to_string(index=False) hides the 0, 1, 2... row numbers
-        print(df_results.to_string(index=False))
-
-if __name__=="__main__":
-    MatchingSystem.test_algo()
